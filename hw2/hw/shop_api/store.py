@@ -1,27 +1,28 @@
-from shop_api.models import CartEntity, CartLine, CartView, ItemEntity
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from shop_api.database import SessionLocal
+from shop_api.models import (
+    CartEntity,
+    CartItemEntity,
+    CartLine,
+    CartView,
+    ItemEntity,
+)
 
 
 class ShopStore:
-    def __init__(self) -> None:
-        self._items: dict[int, ItemEntity] = {}
-        self._carts: dict[int, CartEntity] = {}
-        self._next_item_id = 0
-        self._next_cart_id = 0
-
     def create_cart(self) -> int:
-        self._next_cart_id += 1
-        cart_id = self._next_cart_id
-        self._carts[cart_id] = CartEntity(id=cart_id)
-
-        return cart_id
+        with SessionLocal.begin() as session:
+            cart = CartEntity()
+            session.add(cart)
+            session.flush()
+            return cart.id
 
     def get_cart(self, cart_id: int) -> CartView | None:
-        cart = self._carts.get(cart_id)
-
-        if cart is None:
-            return None
-
-        return self._view(cart)
+        with SessionLocal() as session:
+            cart = session.get(CartEntity, cart_id)
+            return self._view(session, cart) if cart is not None else None
 
     def list_carts(
         self,
@@ -33,44 +34,55 @@ class ShopStore:
         min_quantity: int | None,
         max_quantity: int | None,
     ) -> list[CartView]:
-        views = [self._view(cart) for cart in self._carts.values()]
-        filtered = [
-            view
-            for view in views
-            if _price_matches(view.price, min_price, max_price)
-            and _quantity_matches(_total_quantity(view), min_quantity, max_quantity)
-        ]
-
-        return filtered[offset : offset + limit]
+        with SessionLocal() as session:
+            carts = session.scalars(select(CartEntity).order_by(CartEntity.id)).all()
+            views = [self._view(session, cart) for cart in carts]
+            filtered = [
+                view
+                for view in views
+                if _price_matches(view.price, min_price, max_price)
+                and _quantity_matches(
+                    _total_quantity(view),
+                    min_quantity,
+                    max_quantity,
+                )
+            ]
+            return filtered[offset : offset + limit]
 
     def add_to_cart(self, cart_id: int, item_id: int) -> CartView | None:
-        cart = self._carts.get(cart_id)
-        item = self._items.get(item_id)
+        with SessionLocal.begin() as session:
+            cart = session.scalar(
+                select(CartEntity)
+                .where(CartEntity.id == cart_id)
+                .with_for_update()
+            )
+            item = session.get(ItemEntity, item_id)
+            if cart is None or item is None or item.deleted:
+                return None
 
-        if cart is None or item is None or item.deleted:
-            return None
-
-        cart.lines[item_id] = cart.lines.get(item_id, 0) + 1
-
-        return self._view(cart)
+            line = session.get(CartItemEntity, (cart_id, item_id))
+            if line is None:
+                session.add(
+                    CartItemEntity(cart_id=cart_id, item_id=item_id, quantity=1)
+                )
+            else:
+                line.quantity += 1
+            session.flush()
+            return self._view(session, cart)
 
     def create_item(self, name: str, price: float) -> ItemEntity:
-        self._next_item_id += 1
-        item = ItemEntity(id=self._next_item_id, name=name, price=price)
-        self._items[item.id] = item
-
-        return item
+        with SessionLocal.begin() as session:
+            item = ItemEntity(name=name, price=price)
+            session.add(item)
+            session.flush()
+            return item
 
     def get_item(self, item_id: int, *, include_deleted: bool = False) -> ItemEntity | None:
-        item = self._items.get(item_id)
-
-        if item is None:
-            return None
-
-        if item.deleted and not include_deleted:
-            return None
-
-        return item
+        with SessionLocal() as session:
+            item = session.get(ItemEntity, item_id)
+            if item is None or (item.deleted and not include_deleted):
+                return None
+            return item
 
     def list_items(
         self,
@@ -81,25 +93,27 @@ class ShopStore:
         max_price: float | None,
         show_deleted: bool,
     ) -> list[ItemEntity]:
-        items = [
-            item
-            for item in self._items.values()
-            if (show_deleted or not item.deleted)
-            and _price_matches(item.price, min_price, max_price)
-        ]
+        statement = select(ItemEntity).order_by(ItemEntity.id)
+        if not show_deleted:
+            statement = statement.where(ItemEntity.deleted.is_(False))
+        if min_price is not None:
+            statement = statement.where(ItemEntity.price >= min_price)
+        if max_price is not None:
+            statement = statement.where(ItemEntity.price <= max_price)
+        statement = statement.offset(offset).limit(limit)
 
-        return items[offset : offset + limit]
+        with SessionLocal() as session:
+            return list(session.scalars(statement))
 
     def replace_item(self, item_id: int, name: str, price: float) -> ItemEntity | None:
-        item = self._items.get(item_id)
-
-        if item is None:
-            return None
-
-        item.name = name
-        item.price = price
-
-        return item
+        with SessionLocal.begin() as session:
+            item = session.get(ItemEntity, item_id)
+            if item is None:
+                return None
+            item.name = name
+            item.price = price
+            session.flush()
+            return item
 
     def patch_item(
         self,
@@ -108,44 +122,47 @@ class ShopStore:
         name: str | None,
         price: float | None,
     ) -> ItemEntity | None:
-        item = self._items.get(item_id)
-
-        if item is None or item.deleted:
+        with SessionLocal.begin() as session:
+            item = session.get(ItemEntity, item_id)
+            if item is None or item.deleted:
+                return item
+            if name is not None:
+                item.name = name
+            if price is not None:
+                item.price = price
+            session.flush()
             return item
 
-        if name is not None:
-            item.name = name
-
-        if price is not None:
-            item.price = price
-
-        return item
-
     def delete_item(self, item_id: int) -> ItemEntity | None:
-        item = self._items.get(item_id)
+        with SessionLocal.begin() as session:
+            item = session.get(ItemEntity, item_id)
+            if item is None:
+                return None
+            item.deleted = True
+            session.flush()
+            return item
 
-        if item is None:
-            return None
+    @staticmethod
+    def _view(session: Session, cart: CartEntity) -> CartView:
+        rows = session.execute(
+            select(CartItemEntity, ItemEntity)
+            .join(ItemEntity, ItemEntity.id == CartItemEntity.item_id)
+            .where(CartItemEntity.cart_id == cart.id)
+            .order_by(ItemEntity.id)
+        ).all()
 
-        item.deleted = True
-
-        return item
-
-    def _view(self, cart: CartEntity) -> CartView:
         lines: list[CartLine] = []
         price = 0.0
-
-        for item_id, quantity in cart.lines.items():
-            item = self._items[item_id]
+        for cart_item, item in rows:
             lines.append(
                 CartLine(
                     id=item.id,
                     name=item.name,
-                    quantity=quantity,
+                    quantity=cart_item.quantity,
                     available=not item.deleted,
                 )
             )
-            price += item.price * quantity
+            price += item.price * cart_item.quantity
 
         return CartView(id=cart.id, items=lines, price=price)
 

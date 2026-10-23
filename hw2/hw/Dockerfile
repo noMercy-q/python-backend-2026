@@ -22,6 +22,7 @@ COPY requirements.txt ./requirements.txt
 RUN pip install -r requirements.txt
 
 COPY shop_api ./shop_api
+COPY transactions ./transactions
 
 FROM base AS local
 
