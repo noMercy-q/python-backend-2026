@@ -16,7 +16,6 @@ from shop_api.contracts import (
 )
 from shop_api.store import store
 
-
 router = APIRouter()
 
 

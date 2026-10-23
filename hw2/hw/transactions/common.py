@@ -4,7 +4,6 @@ from collections.abc import Callable
 
 from sqlalchemy import Engine, create_engine
 
-
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+psycopg://shop:shop@localhost:5432/shop",
